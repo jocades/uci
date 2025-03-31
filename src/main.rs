@@ -1,16 +1,16 @@
 #![allow(dead_code)]
 
-use std::{fmt::Write, path::Path, process::Stdio};
+use std::{fmt::Write, path::Path, process::Stdio, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{self, Child, ChildStdin, ChildStdout},
     signal,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     task,
 };
-use tracing::{debug, level_filters::LevelFilter, trace};
+use tracing::{debug, error, level_filters::LevelFilter, trace};
 
 pub struct Engine {
     child: Child,
@@ -38,6 +38,18 @@ async fn reader(stdout: ChildStdout, tx: mpsc::Sender<String>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum Score {
+    Cp(i32),
+    Mate(i32),
+}
+
+impl Default for Score {
+    fn default() -> Self {
+        Self::Cp(0)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Info {
     /// The depth of the search, which is the number of half-moves the engine is looking ahead.
@@ -47,7 +59,7 @@ struct Info {
     /// The number of principal variations (PVs) being considered. In this case, only the best move (single PV) is being reported.
     multipv: u32,
     /// The evaluation score of the position in centipawns (1/100th of a pawn). Positive values favor White, and negative values favor Black.
-    score: i32,
+    score: Score,
     wdl: (u64, u64, u64),
     /// The number of positions (nodes) the engine has evaluated so far.
     nodes: u64,
@@ -63,9 +75,16 @@ struct Info {
     pv: Vec<String>,
 }
 
+#[derive(Debug)]
+struct BestMove {
+    best: String,
+    ponder: String,
+}
+
+#[derive(Debug)]
 enum Search {
     Info(Info),
-    BestMove(String),
+    BestMove(BestMove),
 }
 
 enum State {
@@ -89,13 +108,13 @@ impl Engine {
 
         task::spawn(async move {
             if let Err(e) = writer(stdin, input_rx).await {
-                eprintln!("writer error: {e}");
+                error!(cause = %e, "writer error");
             }
         });
 
         task::spawn(async move {
             if let Err(e) = reader(stdout, output_tx).await {
-                eprintln!("reader error: {e}")
+                error!(cause = %e, "reader error");
             }
         });
 
@@ -113,6 +132,16 @@ impl Engine {
 
     async fn recv(&mut self) -> String {
         self.rx.recv().await.expect("reader died")
+    }
+
+    async fn uci(&mut self) {
+        self.send("uci").await;
+        loop {
+            let line = self.recv().await;
+            if line.starts_with("uciok") {
+                break;
+            }
+        }
     }
 
     async fn isready(&mut self) {
@@ -173,36 +202,58 @@ impl Go {
         self
     }
 
-    async fn execute(&mut self, engine: &mut Engine) -> Result<()> {
-        let mut position = "position".to_string();
-        match &self.position {
-            None => write!(&mut position, " startpos")?,
-            Some(fen) => write!(&mut position, " fen {fen}")?,
-        }
-
-        if !self.moves.is_empty() {
-            write!(&mut position, " moves {}", self.moves.join(" "))?;
-        }
-
-        engine.send(position).await;
-        engine.send(format!("go depth {}", self.depth)).await;
-
-        engine.state = State::Search;
-
-        loop {
-            let line = engine.recv().await;
-            if line.starts_with("info depth") {
-                let info = parse_info(&line[5..])?;
-                debug!(info = ?info);
-            } else if line.starts_with("bestmove") {
-                engine.state = State::Ready;
-                debug!(bestmove = line);
-                break;
+    fn execute(self, engine: Arc<Mutex<Engine>>) -> Searcher {
+        let (tx, rx) = mpsc::channel(100);
+        task::spawn(async move {
+            debug!(?self);
+            if let Err(e) = go(engine, self, tx).await {
+                error!(cause = %e, "go error");
             }
-        }
-
-        Ok(())
+        });
+        Searcher { rx }
     }
+}
+
+struct Searcher {
+    rx: mpsc::Receiver<Search>,
+}
+
+impl Searcher {
+    async fn next(&mut self) -> Option<Search> {
+        self.rx.recv().await
+    }
+}
+
+async fn go(engine: Arc<Mutex<Engine>>, job: Go, tx: mpsc::Sender<Search>) -> Result<()> {
+    let mut position = "position".to_string();
+    match &job.position {
+        None => write!(&mut position, " startpos")?,
+        Some(fen) => write!(&mut position, " fen {fen}")?,
+    };
+
+    if !job.moves.is_empty() {
+        write!(&mut position, " moves {}", job.moves.join(" "))?;
+    }
+
+    let mut engine = engine.lock().await;
+    engine.send(position).await;
+    engine.send(format!("go depth {}", job.depth)).await;
+    engine.state = State::Search;
+
+    loop {
+        let line = engine.recv().await;
+        if line.starts_with("info depth") {
+            let info = line.parse::<Info>()?;
+            _ = tx.send(Search::Info(info)).await;
+        } else if line.starts_with("bestmove") {
+            let bestmove = line.parse::<BestMove>()?;
+            _ = tx.send(Search::BestMove(bestmove)).await;
+            engine.state = State::Ready;
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_info(line: &str) -> Result<Info> {
@@ -215,8 +266,9 @@ fn parse_info(line: &str) -> Result<Info> {
             "seldepth" => info.seldepth = parts.next().context("no seldepth")?.parse()?,
             "multipv" => info.multipv = parts.next().context("no multipv")?.parse()?,
             "score" => match parts.next().context("no score")? {
-                "cp" | "mate" => info.score = parts.next().context("no cp or mate")?.parse()?,
-                other => println!("Unkwown score: {other}"),
+                "cp" => info.score = Score::Cp(parts.next().context("no cp")?.parse()?),
+                "mate" => info.score = Score::Mate(parts.next().context("no mate")?.parse()?),
+                other => eprintln!("Unkwown score: {other}"),
             },
             "wdl" => {
                 info.wdl.0 = parts.next().context("no win %")?.parse()?;
@@ -233,11 +285,35 @@ fn parse_info(line: &str) -> Result<Info> {
                     info.pv.push(mv.into());
                 }
             }
-            other => println!("Unknown part: {other}"),
+            _ => (),
         };
     }
 
     Ok(info)
+}
+
+impl FromStr for Info {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_info(s)
+    }
+}
+
+fn parse_bestmove(line: &str) -> Result<BestMove> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    Ok(BestMove {
+        best: parts[1].into(),
+        ponder: parts[3].into(),
+    })
+}
+
+impl FromStr for BestMove {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_bestmove(s)
+    }
 }
 
 #[tokio::main]
@@ -249,30 +325,33 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let mut engine = Engine::new("stockfish")?;
+    let engine = Arc::new(Mutex::new(Engine::new("stockfish")?));
 
-    engine.send("uci").await;
-    loop {
-        let line = engine.recv().await;
-        if line.starts_with("uciok") {
-            break;
+    {
+        let mut engine = engine.lock().await;
+        engine.uci().await;
+        engine
+            .opts(&[("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "2")])
+            .await;
+        engine.isready().await;
+    }
+
+    {
+        let engine = engine.clone();
+        let mut searcher = Go::new()
+            .moves(&["d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "d7d5"])
+            .depth(32)
+            .execute(engine);
+
+        while let Some(search) = searcher.next().await {
+            match search {
+                Search::Info(info) => debug!(?info),
+                Search::BestMove(bestmove) => debug!(?bestmove),
+            };
         }
     }
 
-    engine
-        .opts(&[("Threads", "6"), ("UCI_ShowWDL", "true")])
-        .await;
-
-    engine.isready().await;
-
-    Go::new()
-        .moves(&["d2d4", "d7d5"])
-        // .fen(FEN_MATE)
-        .depth(5)
-        .execute(&mut engine)
-        .await?;
-
-    _ = signal::ctrl_c().await;
+    // _ = signal::ctrl_c().await;
 
     Ok(())
 }
