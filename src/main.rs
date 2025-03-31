@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{path::Path, process::Stdio};
+use std::{fmt::Write, path::Path, process::Stdio};
 
 use anyhow::{Context, Result};
 use tokio::{
@@ -70,6 +70,7 @@ enum Search {
 enum State {
     Init,
     Ready,
+    Search,
 }
 
 impl Engine {
@@ -137,7 +138,73 @@ impl Engine {
     async fn go(&mut self) {}
 }
 
-fn parse_line(line: &str) -> Result<Info> {
+const FEN_MATE: &str = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4";
+
+#[derive(Debug, Default)]
+struct Go {
+    position: Option<String>,
+    moves: Vec<String>,
+    depth: u32,
+}
+
+impl Go {
+    fn new() -> Self {
+        Self {
+            depth: 10,
+            ..Default::default()
+        }
+    }
+
+    fn fen(mut self, position: impl Into<String>) -> Self {
+        self.position = Some(position.into());
+        self
+    }
+
+    fn moves(mut self, moves: &[impl AsRef<str>]) -> Self {
+        for mv in moves {
+            self.moves.push(mv.as_ref().into());
+        }
+        self
+    }
+
+    fn depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    async fn execute(&mut self, engine: &mut Engine) -> Result<()> {
+        let mut position = "position".to_string();
+        match &self.position {
+            None => write!(&mut position, " startpos")?,
+            Some(fen) => write!(&mut position, " fen {fen}")?,
+        }
+
+        if !self.moves.is_empty() {
+            write!(&mut position, " moves {}", self.moves.join(" "))?;
+        }
+
+        engine.send(position).await;
+        engine.send(format!("go depth {}", self.depth)).await;
+
+        engine.state = State::Search;
+
+        loop {
+            let line = engine.recv().await;
+            if line.starts_with("info depth") {
+                let info = parse_info(&line[5..])?;
+                println!("{info:?}")
+            } else if line.starts_with("bestmove") {
+                engine.state = State::Ready;
+                println!("{line}");
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_info(line: &str) -> Result<Info> {
     let mut info = Info::default();
     let mut parts = line.split_whitespace();
 
@@ -190,19 +257,12 @@ async fn main() -> Result<()> {
 
     engine.isready().await;
 
-    engine.send("position startpos moves d2d4").await;
-
-    engine.send("go depth 5").await;
-    loop {
-        let line = engine.recv().await;
-        if line.starts_with("info depth") {
-            let info = parse_line(&line[5..])?;
-            println!("{info:?}")
-        } else if line.starts_with("bestmove") {
-            println!("{line}");
-            break;
-        }
-    }
+    Go::new()
+        .moves(&["d2d4", "d7d5"])
+        // .fen(FEN_MATE)
+        .depth(5)
+        .execute(&mut engine)
+        .await?;
 
     _ = signal::ctrl_c().await;
 
