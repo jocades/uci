@@ -10,6 +10,7 @@ use tokio::{
     sync::mpsc,
     task,
 };
+use tracing::{debug, level_filters::LevelFilter, trace};
 
 pub struct Engine {
     child: Child,
@@ -20,7 +21,7 @@ pub struct Engine {
 
 async fn writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<String>) -> Result<()> {
     while let Some(cmd) = rx.recv().await {
-        println!("-> {cmd}");
+        trace!("-> {cmd}");
         stdin.write_all(cmd.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
@@ -31,7 +32,7 @@ async fn writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<String>) -> Result
 async fn reader(stdout: ChildStdout, tx: mpsc::Sender<String>) -> Result<()> {
     let mut reader = BufReader::new(stdout).lines();
     while let Some(line) = reader.next_line().await? {
-        println!("<- {line}");
+        trace!("<- {line}");
         _ = tx.send(line).await
     }
     Ok(())
@@ -192,10 +193,10 @@ impl Go {
             let line = engine.recv().await;
             if line.starts_with("info depth") {
                 let info = parse_info(&line[5..])?;
-                println!("{info:?}")
+                debug!(info = ?info);
             } else if line.starts_with("bestmove") {
                 engine.state = State::Ready;
-                println!("{line}");
+                debug!(bestmove = line);
                 break;
             }
         }
@@ -241,6 +242,13 @@ fn parse_info(line: &str) -> Result<Info> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::TRACE)
+        .without_time()
+        .with_target(false)
+        .compact()
+        .init();
+
     let mut engine = Engine::new("stockfish")?;
 
     engine.send("uci").await;
