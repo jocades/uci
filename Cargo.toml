@@ -1,0 +1,8 @@
+[package]
+name = "uci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+tokio = { version = "1.44.1", features = ["full"] }
