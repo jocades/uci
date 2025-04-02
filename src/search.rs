@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug)]
 pub enum Score {
@@ -42,7 +42,7 @@ pub struct Info {
 #[derive(Debug)]
 pub struct BestMove {
     pub best: String,
-    pub ponder: String,
+    pub ponder: Option<String>,
 }
 
 #[derive(Debug)]
@@ -63,7 +63,7 @@ fn parse_info(line: &str) -> Result<Info> {
             "score" => match parts.next().context("no score")? {
                 "cp" => info.score = Score::Cp(parts.next().context("no cp")?.parse()?),
                 "mate" => info.score = Score::Mate(parts.next().context("no mate")?.parse()?),
-                other => eprintln!("Unkwown score: {other}"),
+                other => bail!("Unknown score: {other}"),
             },
             "wdl" => {
                 info.wdl.0 = parts.next().context("no win %")?.parse()?;
@@ -99,7 +99,7 @@ fn parse_bestmove(line: &str) -> Result<BestMove> {
     let parts = line.split_whitespace().collect::<Vec<_>>();
     Ok(BestMove {
         best: parts[1].into(),
-        ponder: parts[3].into(),
+        ponder: (parts.len() > 2).then(|| parts[3].into()),
     })
 }
 

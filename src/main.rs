@@ -5,6 +5,7 @@ use tokio::{signal, sync::Mutex};
 use tracing::debug;
 
 use uci::{
+    FEN_MATE,
     engine::{Engine, Go},
     search::Search,
 };
@@ -27,8 +28,9 @@ async fn main() -> Result<()> {
     {
         let engine = engine.clone();
         let mut searcher = Go::new()
-            .moves(&["d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "d7d5"])
-            .depth(5)
+            // .moves(&["d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "d7d5"])
+            .fen("rnbqr1k1/2p2ppp/pn2p3/bp1pP1NQ/3P4/P1PB4/1P3PPP/RNB2RK1 w - - 5 12")
+            .depth(10)
             .execute(engine);
 
         while let Some(search) = searcher.next().await {

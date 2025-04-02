@@ -185,7 +185,6 @@ async fn go(engine: Arc<Mutex<Engine>>, job: Go, tx: mpsc::Sender<Search>) -> Re
     let mut engine = engine.lock().await;
     engine.send(position).await;
     engine.send(format!("go depth {}", job.depth)).await;
-    engine.state = State::Search;
 
     loop {
         let line = engine.recv().await;
