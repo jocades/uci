@@ -1,14 +1,16 @@
-use std::{fmt::Write, path::Path, process::Stdio};
+use std::{fmt::Write, path::Path, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
+    select,
     sync::mpsc,
+    time,
 };
 use tracing::{debug, error, trace};
 
-use crate::search::{BestMove, Info, Search};
+use uci::search::{BestMove, Info, Search};
 
 async fn writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<String>) -> Result<()> {
     while let Some(mut cmd) = rx.recv().await {
@@ -69,8 +71,8 @@ impl Go {
 
 pub struct Engine {
     _child: Child,
-    pub tx: mpsc::Sender<String>,
-    pub rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<String>,
+    rx: mpsc::Receiver<String>,
 }
 
 impl Engine {
@@ -144,7 +146,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn prepare(&self, job: Go) -> String {
+    fn prepare(&self, job: Go) -> String {
         let mut cmd = "position".to_string();
         match &job.fen {
             None => _ = write!(&mut cmd, " startpos"),
@@ -182,14 +184,68 @@ impl Engine {
     }
 }
 
-pub fn search(line: &str) -> Option<Search> {
+fn search(line: &str) -> Option<Search> {
     if line.starts_with("info depth") {
-        let info = line.parse::<Info>().unwrap();
+        let info = line.parse::<uci::search::Info>().unwrap();
         return Some(Search::Info(info));
     }
     if line.starts_with("bestmove") {
-        let best = line.parse::<BestMove>().unwrap();
+        let best = line.parse::<uci::search::BestMove>().unwrap();
         return Some(Search::BestMove(best));
     }
     None
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    setup_logging();
+
+    let mut engine = Engine::new("stockfish")?;
+    let options = [("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "2")];
+
+    engine.uci().await?;
+
+    engine.opts(&options).await?;
+    engine.isready().await?;
+
+    let job = Go::new().moves(&["e2e4"]).depth(10);
+    let cmd = engine.prepare(job);
+
+    engine.tx.send(cmd).await?;
+
+    let timer = time::sleep(Duration::from_secs(1));
+    tokio::pin!(timer);
+
+    loop {
+        select! {
+            Some(line) = engine.rx.recv() => match search(&line) {
+                Some(Search::Info(info)) => {
+                    tracing::info!(?info);
+                },
+                Some(Search::BestMove(best)) => {
+                    tracing::info!(?best);
+                    break;
+                },
+                None => continue,
+            },
+            _ = &mut timer => {
+                debug!("timer done");
+                engine.stop().await?;
+                break;
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn setup_logging() {
+    use tracing::level_filters::LevelFilter;
+
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::TRACE)
+        .without_time()
+        .with_target(false)
+        .compact()
+        .init();
 }

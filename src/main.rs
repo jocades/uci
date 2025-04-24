@@ -1,12 +1,11 @@
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use tokio::{signal, sync::Mutex};
+use tokio::{select, time};
 use tracing::debug;
 
 use uci::{
-    FEN_MATE,
-    engine::{Engine, Go},
+    engine::{Engine, Go, search},
     search::Search,
 };
 
@@ -14,34 +13,41 @@ use uci::{
 async fn main() -> Result<()> {
     setup_logging();
 
-    let engine = Arc::new(Mutex::new(Engine::new("stockfish")?));
+    let mut engine = Engine::new("stockfish")?;
+    let options = [("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "2")];
 
-    {
-        let mut engine = engine.lock().await;
-        engine.uci().await;
-        engine
-            .opts(&[("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "2")])
-            .await;
-        engine.isready().await;
-    }
+    engine.uci().await?;
 
-    {
-        let engine = engine.clone();
-        let mut searcher = Go::new()
-            // .moves(&["d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "d7d5"])
-            .fen("rnbqr1k1/2p2ppp/pn2p3/bp1pP1NQ/3P4/P1PB4/1P3PPP/RNB2RK1 w - - 5 12")
-            .depth(10)
-            .execute(engine);
+    engine.opts(&options).await?;
+    engine.isready().await?;
 
-        while let Some(search) = searcher.next().await {
-            match search {
-                Search::Info(info) => debug!(?info),
-                Search::BestMove(bestmove) => debug!(?bestmove),
-            };
+    let job = Go::new().moves(&["e2e4"]).depth(10);
+    let cmd = engine.prepare(job);
+
+    engine.tx.send(cmd).await?;
+
+    let timer = time::sleep(Duration::from_secs(1));
+    tokio::pin!(timer);
+
+    loop {
+        select! {
+            Some(line) = engine.rx.recv() => match search(&line) {
+                Some(Search::Info(info)) => {
+                    tracing::info!(?info);
+                },
+                Some(Search::BestMove(best)) => {
+                    tracing::info!(?best);
+                    break;
+                },
+                None => continue,
+            },
+            _ = &mut timer => {
+                debug!("timer done");
+                engine.stop().await?;
+                break;
+            },
         }
     }
-
-    _ = signal::ctrl_c().await;
 
     Ok(())
 }

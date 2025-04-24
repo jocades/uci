@@ -1,12 +1,12 @@
 use std::process::Stdio;
+use std::time::Duration;
 use std::{fmt::Write, path::Path};
 
 use anyhow::Result;
-use tokio::sync::oneshot;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin},
-    sync::mpsc,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout},
+    sync::{mpsc, oneshot},
     task,
 };
 use uci::search::{BestMove, Info, Search};
@@ -16,6 +16,18 @@ enum Command {
     IsReady(oneshot::Sender<()>),
     SetOption { name: String, value: String },
     Go { job: Go, tx: mpsc::Sender<Search> },
+    Stop(oneshot::Sender<()>),
+}
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::IsReady(_) => write!(f, "isready"),
+            Command::SetOption { name, value } => write!(f, "setoption {name}: {value}"),
+            Command::Go { job, .. } => write!(f, "go depth: {}", job.depth),
+            Command::Stop(_) => write!(f, "stop"),
+        }
+    }
 }
 
 struct Engine {
@@ -31,26 +43,17 @@ impl Engine {
         let mut reader = BufReader::new(stdout).lines();
 
         stdin.write_all(b"uci\n").await?;
-        while let Some(line) = reader.next_line().await? {
-            if line == "uciok" {
-                break;
-            }
-        }
+        self.wait(&mut reader, "uciok").await?;
 
         while let Some(cmd) = self.rx.recv().await {
-            println!("{cmd:?}");
+            println!("-> {cmd}");
             match cmd {
                 Command::IsReady(ack) => {
-                    stdin.write_all(b"isready\n").await?;
-                    while let Some(line) = reader.next_line().await? {
-                        if line == "readyok" {
-                            _ = ack.send(());
-                            break;
-                        }
-                    }
+                    self.isready(&mut stdin, &mut reader).await?;
+                    _ = ack.send(());
                 }
                 Command::SetOption { name, value } => todo!(),
-                Command::Go { job, tx: resp } => {
+                Command::Go { job, tx } => {
                     let mut position = "position".to_string();
 
                     match &job.position {
@@ -67,20 +70,46 @@ impl Engine {
                         .write_all(format!("go depth {}\n", job.depth).as_bytes())
                         .await?;
 
-                    while let Some(line) = reader.next_line().await.unwrap() {
+                    while let Some(line) = reader.next_line().await? {
                         if line.starts_with("info depth") {
                             let info = line.parse::<Info>().unwrap();
-                            _ = resp.send(Search::Info(info)).await;
+                            _ = tx.send(Search::Info(info)).await;
                         } else if line.starts_with("bestmove") {
                             let bestmove = line.parse::<BestMove>().unwrap();
-                            _ = resp.send(Search::BestMove(bestmove)).await;
+                            _ = tx.send(Search::BestMove(bestmove)).await;
                             break;
                         }
                     }
                 }
+                Command::Stop(ack) => {
+                    stdin.write_all(b"stop\nisready\n").await?;
+                    stdin.write_all(b"isready\n").await?;
+                    self.wait(&mut reader, "readyok").await?;
+                    _ = ack.send(());
+                    eprintln!("stopped!");
+                }
             }
         }
 
+        Ok(())
+    }
+
+    async fn isready(
+        &mut self,
+        stdin: &mut ChildStdin,
+        reader: &mut Lines<BufReader<ChildStdout>>,
+    ) -> Result<()> {
+        stdin.write_all(b"isready\n").await?;
+        self.wait(reader, "readyok").await?;
+        Ok(())
+    }
+
+    async fn wait(&self, reader: &mut Lines<BufReader<ChildStdout>>, kw: &str) -> Result<()> {
+        while let Some(line) = reader.next_line().await? {
+            if line == kw {
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -149,6 +178,13 @@ impl Handle {
         self.tx.send(Command::Go { job, tx }).await?;
         Ok(Searcher { rx })
     }
+
+    async fn stop(&self) -> Result<()> {
+        let (ack, syn) = oneshot::channel();
+        self.tx.send(Command::Stop(ack)).await?;
+        syn.await?;
+        Ok(())
+    }
 }
 
 fn spawn() -> Result<Handle> {
@@ -184,16 +220,39 @@ async fn main() -> Result<()> {
 
     let searcher = Go::new()
         .moves(&["d2d4", "g8f6", "c2c4", "e7e6", "g2g3"])
-        .depth(5)
+        // .moves(&["f2f3", "e7e5", "g2g4"])
+        .depth(25)
         .execute(&engine)
         .await?;
 
-    search(searcher).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    engine.stop().await?;
 
-    let job = Go::new().moves(&["d2d4", "g8f6"]).depth(10);
-    let searcher = engine.go(job).await?;
+    // search(searcher).await;
 
-    search(searcher).await;
+    // let job = Go::new().moves(&["d2d4", "g8f6"]).depth(10);
+    // let searcher = engine.go(job).await?;
+    //
+    // let timer = tokio::time::sleep(Duration::from_millis(500));
+    // tokio::pin!(timer);
+    //
+    // search(searcher).await;
+
+    // loop {
+    //     tokio::select! {
+    //         search = searcher.next() => eprintln!("{search:?}"),
+    //         // () = &mut timer => {
+    //         //     println!("timeout");
+    //         //     engine.stop().await?;
+    //         //     break;
+    //         // }
+    //
+    //     }
+    // }
+
+    println!("done!");
+
+    // search(searcher).await;
 
     // let mut rx = engine.go().await?;
     //
