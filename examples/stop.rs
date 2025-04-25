@@ -5,7 +5,7 @@ use tokio::{select, time};
 
 use uci::{
     engine::{Engine, Go, search},
-    search::{BestMove, Info, Search},
+    search::Search,
 };
 
 #[tokio::main]
@@ -21,14 +21,12 @@ async fn main() -> Result<()> {
     engine.isready().await?;
 
     let job = Go::new().moves(&["f2f3"]).depth(25);
-    let (info, best) = engine.go(job).await?;
-    tracing::debug!(?info, ?best);
-
-    return Ok(());
+    let cmd = engine.prepare(job);
 
     let timer = time::sleep(Duration::from_secs(1));
     tokio::pin!(timer);
 
+    engine.tx.send(cmd).await?;
     loop {
         select! {
             Some(line) = engine.rx.recv() => match search(&line) {

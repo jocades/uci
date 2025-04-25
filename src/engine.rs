@@ -91,7 +91,6 @@ impl Engine {
         });
 
         let (output_tx, output_rx) = mpsc::channel(32);
-        // let output_rx = Arc::new(Mutex::new(output_rx));
         tokio::spawn(async move {
             if let Err(e) = reader(stdout, output_tx).await {
                 error!(cause = %e, "reader error");
@@ -107,7 +106,6 @@ impl Engine {
 
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn wait(&mut self, keyword: &str) {
-        // let mut rx = self.rx.lock().await;
         while let Some(line) = self.rx.recv().await {
             if line == keyword {
                 break;

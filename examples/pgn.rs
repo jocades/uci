@@ -3,7 +3,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use pgn_reader::{BufferedReader, RawHeader, SanPlus, Skip, Visitor};
 use shakmaty::{CastlingMode, Chess, EnPassantMode, FromSetup, Position, Setup, fen::Fen};
-use tokio::{signal, sync::Mutex};
 
 use uci::{
     engine::{Engine, Go},
@@ -71,10 +70,13 @@ impl Visitor for Extractor {
 
     fn san(&mut self, san_plus: SanPlus) {
         let before = Fen::from(self.pos.clone().into_setup(EnPassantMode::Legal)).to_string();
+
         if let Ok(m) = san_plus.san.to_move(&self.pos) {
             self.pos.play_unchecked(&m);
         }
+
         let after = Fen::from(self.pos.clone().into_setup(EnPassantMode::Legal)).to_string();
+
         self.moves.push(Move {
             san: san_plus.to_string(),
             before,
@@ -96,28 +98,19 @@ async fn main() -> Result<()> {
     let mut visitor = Extractor::default();
     reader.read_game(&mut visitor)?;
 
+    let mut engine = Engine::new("stockfish")?;
+    let options = [("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "2")];
+
+    engine.uci().await?;
+
+    engine.opts(&options).await?;
+    engine.isready().await?;
+
+    // for m in &visitor.moves {
+    //     engine
+    // }
+
     println!("{:#?}", visitor);
-
-    let engine = Arc::new(Mutex::new(Engine::new("stockfish")?));
-
-    {
-        let mut engine = engine.lock().await;
-        engine.uci().await;
-        engine
-            .opts(&[("Threads", "8"), ("UCI_ShowWDL", "true"), ("MultiPV", "1")])
-            .await;
-        engine.isready().await;
-    }
-
-    let m = &visitor.moves[0];
-    let mut searcher = Go::new().fen(&m.before).depth(10).execute(engine);
-
-    while let Some(search) = searcher.next().await {
-        match search {
-            Search::Info(info) => println!("{info:#?}"),
-            Search::BestMove(bestmove) => println!("{bestmove:#?}"),
-        };
-    }
 
     Ok(())
 }
